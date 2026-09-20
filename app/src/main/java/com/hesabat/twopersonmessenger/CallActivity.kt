@@ -1,166 +1,642 @@
 package com.hesabat.twopersonmessenger
 
 import android.Manifest
-import android.content.Context
 import android.content.pm.PackageManager
-import android.media.AudioManager
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.view.View
+import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
+
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
-import com.google.gson.Gson
-import com.hesabat.twopersonmessenger.databinding.ActivityCallBinding
+
 import io.livekit.android.LiveKit
 import io.livekit.android.events.RoomEvent
+import io.livekit.android.events.collect
 import io.livekit.android.room.Room
 import io.livekit.android.room.track.VideoTrack
+
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
-class CallActivity : AppCompatActivity() {
-    private lateinit var b: ActivityCallBinding
-    private val h = Handler(Looper.getMainLooper())
-    private var room: Room? = null
-    private var eventJob: Job? = null
-    private var callUuid = ""
-    private var incoming = false
-    private var video = false
-    private var muted = false
-    private var cameraOn = true
-    private var lastSignal = 0L
-    private var connecting = false
-    private val poll = object : Runnable { override fun run() { pollControlSignals(); h.postDelayed(this, 900) } }
+import okhttp3.FormBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
 
-    private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
-        if (result.values.all { it }) prepareCall() else {
-            Toast.makeText(this, "Mikrofon/kamera icazəsi lazımdır", Toast.LENGTH_LONG).show(); finish()
-        }
+import org.json.JSONObject
+
+import org.webrtc.SurfaceViewRenderer
+
+class CallActivity : AppCompatActivity() {
+
+    companion object {
+        private const val API_BASE =
+            "https://hesabat.site/wp/api/"
     }
+
+    private lateinit var room: Room
+
+    private var eventJob: Job? = null
+
+    private var isVideoCall = false
+    private var microphoneEnabled = true
+    private var cameraEnabled = false
+    private var connected = false
+
+    private var callUuid: String = ""
+
+    private var remoteRenderer: SurfaceViewRenderer? = null
+    private var localRenderer: SurfaceViewRenderer? = null
+
+    private var statusText: TextView? = null
+
+    private var muteButton: Button? = null
+    private var cameraButton: Button? = null
+    private var endButton: Button? = null
+
+    private val httpClient = OkHttpClient()
+
+    private val permissionLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.RequestMultiplePermissions()
+        ) { permissions ->
+
+            val microphoneGranted =
+                permissions[Manifest.permission.RECORD_AUDIO] == true ||
+                    ContextCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.RECORD_AUDIO
+                    ) == PackageManager.PERMISSION_GRANTED
+
+            val cameraGranted =
+                permissions[Manifest.permission.CAMERA] == true ||
+                    ContextCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.CAMERA
+                    ) == PackageManager.PERMISSION_GRANTED
+
+            if (!microphoneGranted) {
+                Toast.makeText(
+                    this,
+                    "Mikrofon icazəsi lazımdır",
+                    Toast.LENGTH_LONG
+                ).show()
+
+                finish()
+                return@registerForActivityResult
+            }
+
+            if (isVideoCall && !cameraGranted) {
+                Toast.makeText(
+                    this,
+                    "Kamera icazəsi verilmədi. Zəng səsli davam edəcək.",
+                    Toast.LENGTH_LONG
+                ).show()
+
+                isVideoCall = false
+            }
+
+            startLiveKit()
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        b = ActivityCallBinding.inflate(layoutInflater); setContentView(b.root)
-        window.setFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE, android.view.WindowManager.LayoutParams.FLAG_SECURE)
-        incoming = intent.getBooleanExtra("incoming", false)
-        video = intent.getBooleanExtra("video", false)
-        callUuid = intent.getStringExtra("call_uuid") ?: ""
-        b.callType.text = if (video) "Video zəng" else "Səsli zəng"
-        b.videoContainer.visibility = if (video) View.VISIBLE else View.GONE
-        b.localVideo.visibility = View.GONE // first stable LiveKit build: remote video only
-        b.cameraBtn.visibility = if (video) View.VISIBLE else View.GONE
-        b.switchBtn.visibility = View.GONE
-        b.acceptBtn.visibility = if (incoming) View.VISIBLE else View.GONE
-        b.rejectBtn.visibility = if (incoming) View.VISIBLE else View.GONE
-        b.controls.visibility = if (incoming) View.GONE else View.VISIBLE
 
-        b.acceptBtn.setOnClickListener {
-            b.acceptBtn.visibility = View.GONE; b.rejectBtn.visibility = View.GONE; b.controls.visibility = View.VISIBLE
-            signal("answer"); ensurePermissions()
+        setContentView(R.layout.activity_call)
+
+        callUuid =
+            intent.getStringExtra("call_uuid")
+                ?: intent.getStringExtra("call_id")
+                ?: ""
+
+        isVideoCall =
+            intent.getBooleanExtra("is_video", false) ||
+                intent.getStringExtra("call_type")
+                    ?.equals("video", ignoreCase = true) == true
+
+        statusText =
+            findViewByIdSafe("callStatus")
+
+        if (statusText == null) {
+            statusText =
+                findViewByIdSafe("statusText")
         }
-        b.rejectBtn.setOnClickListener { signal("reject"); finish() }
-        b.endBtn.setOnClickListener { signal("hangup"); finish() }
-        b.micBtn.setOnClickListener {
-            muted = !muted
-            lifecycleScope.launch { room?.localParticipant?.setMicrophoneEnabled(!muted) }
-            b.micBtn.text = if (muted) "Mikrofon aç" else "Mikrofon"
+
+        remoteRenderer =
+            findViewByIdSafe("remoteVideo")
+
+        localRenderer =
+            findViewByIdSafe("localVideo")
+
+        muteButton =
+            findViewByIdSafe("btnMute")
+
+        cameraButton =
+            findViewByIdSafe("btnCamera")
+
+        endButton =
+            findViewByIdSafe("btnEnd")
+
+        muteButton?.setOnClickListener {
+            toggleMicrophone()
         }
-        b.cameraBtn.setOnClickListener {
-            cameraOn = !cameraOn
-            lifecycleScope.launch { room?.localParticipant?.setCameraEnabled(cameraOn) }
-            b.cameraBtn.text = if (cameraOn) "Kamera" else "Kamera aç"
+
+        cameraButton?.setOnClickListener {
+            toggleCamera()
         }
-        b.speakerBtn.setOnClickListener {
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            @Suppress("DEPRECATION")
-            run { am.isSpeakerphoneOn = !am.isSpeakerphoneOn; b.speakerBtn.text = if (am.isSpeakerphoneOn) "Səs: açıq" else "Səs" }
+
+        endButton?.setOnClickListener {
+            endCall()
         }
-        if (!incoming) ensurePermissions() else b.callStatus.text = "Gələn zəng"
-        h.post(poll)
+
+        if (!isVideoCall) {
+            cameraButton?.visibility = View.GONE
+            localRenderer?.visibility = View.GONE
+        }
+
+        requestRequiredPermissions()
     }
 
-    private fun ensurePermissions() {
-        val ps = mutableListOf(Manifest.permission.RECORD_AUDIO); if (video) ps += Manifest.permission.CAMERA
-        val missing = ps.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isEmpty()) prepareCall() else permissionLauncher.launch(missing.toTypedArray())
+    @Suppress("UNCHECKED_CAST")
+    private fun <T : View> findViewByIdSafe(name: String): T? {
+        val id = resources.getIdentifier(
+            name,
+            "id",
+            packageName
+        )
+
+        if (id == 0) {
+            return null
+        }
+
+        return findViewById<View>(id) as? T
     }
 
-    private fun prepareCall() {
-        if (connecting) return
-        connecting = true
-        if (!incoming && callUuid.isBlank()) {
-            b.callStatus.text = "Zəng hazırlanır…"
-            Api.post("call_start.php", mapOf("call_type" to if (video) "video" else "audio"), Session.token(this)) { ok, raw ->
-                val r = if (ok) runCatching { Gson().fromJson(raw, CallStartResponse::class.java) }.getOrNull() else null
-                if (r == null || r.call_uuid.isBlank()) runOnUiThread { fail("Zəng başladıla bilmədi") }
-                else { callUuid = r.call_uuid; requestLiveKitToken() }
-            }
-        } else requestLiveKitToken()
-    }
+    private fun requestRequiredPermissions() {
 
-    private fun requestLiveKitToken() {
-        Api.post("livekit_token.php", mapOf("call_uuid" to callUuid), Session.token(this)) { ok, raw ->
-            val r = if (ok) runCatching { Gson().fromJson(raw, LiveKitTokenResponse::class.java) }.getOrNull() else null
-            if (r == null || !r.ok || r.server_url.isBlank() || r.participant_token.isBlank()) runOnUiThread { fail("Zəng serverinə qoşulmaq mümkün olmadı") }
-            else runOnUiThread { connectLiveKit(r.server_url, r.participant_token) }
+        val permissions = mutableListOf<String>()
+
+        if (
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            permissions.add(
+                Manifest.permission.RECORD_AUDIO
+            )
+        }
+
+        if (
+            isVideoCall &&
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.CAMERA
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            permissions.add(
+                Manifest.permission.CAMERA
+            )
+        }
+
+        if (permissions.isEmpty()) {
+            startLiveKit()
+        } else {
+            permissionLauncher.launch(
+                permissions.toTypedArray()
+            )
         }
     }
 
-    private fun connectLiveKit(url: String, token: String) {
-        val lkRoom = LiveKit.create(applicationContext)
-        room = lkRoom
-        if (video) lkRoom.initVideoRenderer(b.remoteVideo)
-        eventJob = lifecycleScope.launch {
-            launch {
-                lkRoom.events.collect { event ->
+    private fun startLiveKit() {
+
+        setStatus("Qoşulur...")
+
+        room = LiveKit.create(
+            applicationContext
+        )
+
+        remoteRenderer?.let {
+            room.initVideoRenderer(it)
+        }
+
+        localRenderer?.let {
+            room.initVideoRenderer(it)
+        }
+
+        observeRoomEvents()
+
+        requestLiveKitToken()
+    }
+
+    private fun observeRoomEvents() {
+
+        eventJob?.cancel()
+
+        eventJob =
+            lifecycleScope.launch {
+
+                room.events.collect { event ->
+
                     when (event) {
-                        is RoomEvent.TrackSubscribed -> if (event.track is VideoTrack) {
-                            (event.track as VideoTrack).addRenderer(b.remoteVideo)
+
+                        is RoomEvent.Connected -> {
+                            connected = true
+                            setStatus("Zəng qoşuldu")
                         }
-                        is RoomEvent.Disconnected -> runOnUiThread { b.callStatus.text = "Zəng bitdi" }
+
+                        is RoomEvent.Disconnected -> {
+                            connected = false
+                            setStatus("Zəng bitdi")
+
+                            if (!isFinishing) {
+                                finish()
+                            }
+                        }
+
+                        is RoomEvent.TrackSubscribed -> {
+
+                            val track = event.track
+
+                            if (track is VideoTrack) {
+
+                                remoteRenderer?.let { renderer ->
+
+                                    track.addRenderer(
+                                        renderer
+                                    )
+
+                                    renderer.visibility =
+                                        View.VISIBLE
+                                }
+                            }
+                        }
+
                         else -> Unit
                     }
                 }
             }
+    }
+
+    private fun requestLiveKitToken() {
+
+        lifecycleScope.launch {
+
             try {
-                b.callStatus.text = "Qoşulur…"
-                lkRoom.connect(url, token)
-                lkRoom.localParticipant.setMicrophoneEnabled(true)
-                if (video) lkRoom.localParticipant.setCameraEnabled(true)
-                b.callStatus.text = "Qoşuldu"
-            } catch (e: Throwable) { fail("LiveKit bağlantısı alınmadı") }
-        }
-    }
 
-    private fun signal(type: String) {
-        if (callUuid.isBlank()) return
-        Api.post("call_signal.php", mapOf("call_uuid" to callUuid, "signal_type" to type, "payload" to null), Session.token(this)) { _, _ -> }
-    }
+                val sessionToken =
+                    Session.token(this@CallActivity)
 
-    private fun pollControlSignals() {
-        if (callUuid.isBlank()) return
-        Api.get("call_poll.php?after_id=$lastSignal", Session.token(this)) { ok, raw ->
-            if (!ok) return@get
-            val r = runCatching { Gson().fromJson(raw, SignalResponse::class.java) }.getOrNull() ?: return@get
-            r.signals.filter { it.call_uuid == callUuid }.forEach { s ->
-                lastSignal = maxOf(lastSignal, s.id)
-                if (s.signal_type == "hangup" || s.signal_type == "reject") runOnUiThread {
-                    b.callStatus.text = if (s.signal_type == "reject") "Zəng rədd edildi" else "Zəng bitdi"
-                    h.postDelayed({ finish() }, 500)
+                if (sessionToken.isBlank()) {
+                    showError(
+                        "Login token tapılmadı"
+                    )
+                    return@launch
                 }
+
+                val formBuilder =
+                    FormBody.Builder()
+
+                if (callUuid.isNotBlank()) {
+                    formBuilder.add(
+                        "call_uuid",
+                        callUuid
+                    )
+                }
+
+                formBuilder.add(
+                    "call_type",
+                    if (isVideoCall) {
+                        "video"
+                    } else {
+                        "audio"
+                    }
+                )
+
+                val request =
+                    Request.Builder()
+                        .url(
+                            API_BASE +
+                                "livekit_token.php"
+                        )
+                        .addHeader(
+                            "Authorization",
+                            "Bearer $sessionToken"
+                        )
+                        .post(
+                            formBuilder.build()
+                        )
+                        .build()
+
+                val response =
+                    kotlinx.coroutines
+                        .withContext(
+                            kotlinx.coroutines
+                                .Dispatchers.IO
+                        ) {
+                            httpClient
+                                .newCall(request)
+                                .execute()
+                        }
+
+                val body =
+                    response.body?.string()
+                        ?: ""
+
+                if (!response.isSuccessful) {
+
+                    showError(
+                        "Server xətası: " +
+                            response.code
+                    )
+
+                    return@launch
+                }
+
+                val json =
+                    JSONObject(body)
+
+                if (!json.optBoolean("ok")) {
+
+                    showError(
+                        json.optString(
+                            "error",
+                            "LiveKit token alınmadı"
+                        )
+                    )
+
+                    return@launch
+                }
+
+                val liveKitUrl =
+                    when {
+                        json.has("url") ->
+                            json.optString("url")
+
+                        json.has("server_url") ->
+                            json.optString(
+                                "server_url"
+                            )
+
+                        else -> ""
+                    }
+
+                val liveKitToken =
+                    when {
+                        json.has("token") ->
+                            json.optString("token")
+
+                        json.has(
+                            "participant_token"
+                        ) ->
+                            json.optString(
+                                "participant_token"
+                            )
+
+                        else -> ""
+                    }
+
+                if (
+                    liveKitUrl.isBlank() ||
+                    liveKitToken.isBlank()
+                ) {
+
+                    showError(
+                        "Server LiveKit URL və ya token qaytarmadı"
+                    )
+
+                    return@launch
+                }
+
+                connectToRoom(
+                    liveKitUrl,
+                    liveKitToken
+                )
+
+            } catch (e: Exception) {
+
+                showError(
+                    e.message
+                        ?: "LiveKit token xətası"
+                )
             }
         }
     }
 
-    private fun fail(message: String) { b.callStatus.text = message; Toast.makeText(this, message, Toast.LENGTH_LONG).show(); h.postDelayed({ finish() }, 1600) }
+    private suspend fun connectToRoom(
+        url: String,
+        token: String
+    ) {
+
+        try {
+
+            setStatus("LiveKit-ə qoşulur...")
+
+            room.connect(
+                url,
+                token
+            )
+
+            connected = true
+
+            room.localParticipant
+                .setMicrophoneEnabled(true)
+
+            microphoneEnabled = true
+
+            if (isVideoCall) {
+
+                room.localParticipant
+                    .setCameraEnabled(true)
+
+                cameraEnabled = true
+
+                attachLocalVideo()
+            }
+
+            setStatus("Zəng qoşuldu")
+
+        } catch (e: Exception) {
+
+            showError(
+                "Zəng bağlantısı alınmadı: " +
+                    (
+                        e.message
+                            ?: "naməlum xəta"
+                    )
+            )
+        }
+    }
+
+    private fun attachLocalVideo() {
+
+        val renderer =
+            localRenderer
+                ?: return
+
+        renderer.visibility =
+            View.VISIBLE
+
+        val publications =
+            room.localParticipant
+                .trackPublications
+                .values
+
+        for (publication in publications) {
+
+            val track =
+                publication.track
+
+            if (track is VideoTrack) {
+
+                track.addRenderer(
+                    renderer
+                )
+
+                break
+            }
+        }
+    }
+
+    private fun toggleMicrophone() {
+
+        if (!::room.isInitialized) {
+            return
+        }
+
+        lifecycleScope.launch {
+
+            try {
+
+                microphoneEnabled =
+                    !microphoneEnabled
+
+                room.localParticipant
+                    .setMicrophoneEnabled(
+                        microphoneEnabled
+                    )
+
+                muteButton?.text =
+                    if (microphoneEnabled) {
+                        "Səsi söndür"
+                    } else {
+                        "Səsi aç"
+                    }
+
+            } catch (e: Exception) {
+
+                Toast.makeText(
+                    this@CallActivity,
+                    "Mikrofon dəyişdirilə bilmədi",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    private fun toggleCamera() {
+
+        if (!::room.isInitialized) {
+            return
+        }
+
+        lifecycleScope.launch {
+
+            try {
+
+                cameraEnabled =
+                    !cameraEnabled
+
+                room.localParticipant
+                    .setCameraEnabled(
+                        cameraEnabled
+                    )
+
+                if (cameraEnabled) {
+                    attachLocalVideo()
+                } else {
+                    localRenderer?.visibility =
+                        View.GONE
+                }
+
+                cameraButton?.text =
+                    if (cameraEnabled) {
+                        "Kameranı söndür"
+                    } else {
+                        "Kameranı aç"
+                    }
+
+            } catch (e: Exception) {
+
+                Toast.makeText(
+                    this@CallActivity,
+                    "Kamera dəyişdirilə bilmədi",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    private fun setStatus(
+        text: String
+    ) {
+
+        runOnUiThread {
+            statusText?.text = text
+        }
+    }
+
+    private fun showError(
+        message: String
+    ) {
+
+        runOnUiThread {
+
+            setStatus("Xəta")
+
+            Toast.makeText(
+                this,
+                message,
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    private fun endCall() {
+
+        connected = false
+
+        if (::room.isInitialized) {
+
+            try {
+                room.disconnect()
+            } catch (_: Exception) {
+            }
+        }
+
+        finish()
+    }
 
     override fun onDestroy() {
-        h.removeCallbacks(poll); eventJob?.cancel()
-        room?.disconnect(); room?.release(); room = null
+
+        eventJob?.cancel()
+
+        if (::room.isInitialized) {
+
+            try {
+                room.disconnect()
+            } catch (_: Exception) {
+            }
+
+            try {
+                room.release()
+            } catch (_: Exception) {
+            }
+        }
+
         super.onDestroy()
     }
 }
